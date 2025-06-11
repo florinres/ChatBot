@@ -1,0 +1,8 @@
+/input
+/output
+/instruction_dataset.jsonl
+/instruction_dataset.temp
+ultrachat_chunk_eval.jsonl
+ultrachat_chunk_eval.jsonl.tmp
+ultrachat_chunk_train.jsonl
+ultrachat_chunk_train.jsonl.tmp
