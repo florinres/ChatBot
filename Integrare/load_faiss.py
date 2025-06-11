@@ -5,7 +5,9 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 
-DOCUMENTS_FOLDER = "D:/chatbot/output"
+# Cale relativă față de acest fișier
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DOCUMENTS_FOLDER = os.path.join(BASE_DIR, "output")
 
 URL_MAPPINGS = {
     "admitere": "www.inginerie.ulbsibiu.ro/admitere",
@@ -60,6 +62,7 @@ def load_documents(folder_path):
                 docs.append(f"[Source: {filename}]\n{text}")
         except Exception as e:
             print(f"⚠ Eroare la fișierul {path}: {e}")
+    print(f"[INFO] S-au încărcat {len(docs)} documente din folderul '{folder_path}'.")
     return docs
 
 
@@ -81,3 +84,6 @@ def get_vector_store():
 def find_relevant_urls(question, context=""):
     combined = f"{question} {context}".lower()
     return [url for keyword, url in URL_MAPPINGS.items() if keyword in combined]
+
+if __name__ == '__main__':
+    load_documents(DOCUMENTS_FOLDER)

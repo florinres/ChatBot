@@ -2,18 +2,20 @@ from flask import Flask, request, jsonify
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 from peft import PeftModel
 from load_faiss import get_vector_store, find_relevant_urls
+import os 
 
 print("🔧 Inițializare server model...")
 
 # Incarcă modelul TinyLLaMA + adapter PEFT
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 base_model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-adapter_path = "D:/chatbot/adapter"
+adapter_path =  os.path.join(BASE_DIR, "adapter")
 
 print("🔄 Încărcare model și tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(base_model_id)
-base_model = AutoModelForCausalLM.from_pretrained(base_model_id).to("cuda")
-model = PeftModel.from_pretrained(base_model, adapter_path).merge_and_unload().to("cuda")
-pipe = pipeline("text-generation", model=model, tokenizer=tokenizer, device=0, max_new_tokens=256)
+base_model = AutoModelForCausalLM.from_pretrained(base_model_id).to("cpu")
+model = PeftModel.from_pretrained(base_model, adapter_path).merge_and_unload().to("cpu")
+pipe = pipeline("text-generation", model=model, tokenizer=tokenizer, device=-1)  
 
 print("✅ Model încărcat și pregătit.")
 

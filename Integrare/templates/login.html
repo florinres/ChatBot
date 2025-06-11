@@ -1,19 +1,163 @@
-<!DOCTYPE html>
+<!-- templates/form_base.html -->
+<!doctype html>
 <html lang="ro">
 <head>
-    <meta charset="UTF-8">
-    <title>Login</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ title }}</title>
+  <link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <style>
+:root {
+    --main-blue: #0057b8;
+    --light-blue: #e6f0ff;
+    --gray-bg: #f9f9f9;
+    --gray-border: #d0d0d0;
+    --text-color: #222;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  body {
+    margin: 0;
+    padding: 0;
+    font-family: 'Roboto Mono', monospace;
+    background: var(--gray-bg);
+    color: var(--text-color);
+    line-height: 1.6;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+  }
+
+  .container {
+    max-width: 400px;
+    background: #fff;
+    padding: 30px;
+    border-radius: 8px;
+    border: 1px solid var(--gray-border);
+    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+  }
+
+  h1 {
+    text-align: center;
+    color: var(--main-blue);
+    font-size: 24px;
+    margin-bottom: 24px;
+  }
+
+  .form-group {
+    margin-bottom: 20px;
+  }
+
+  label {
+    display: block;
+    margin-bottom: 5px;
+    font-weight: 600;
+  }
+
+  input[type="text"],
+  input[type="password"] {
+    width: 100%;
+    padding: 12px;
+    border: 1px solid var(--gray-border);
+    border-radius: 6px;
+    font-size: 16px;
+    background: #fefefe;
+  }
+
+  input[type="submit"] {
+    width: 100%;
+    background-color: var(--main-blue);
+    color: white;
+    padding: 14px;
+    border: none;
+    border-radius: 6px;
+    font-size: 16px;
+    font-weight: bold;
+    transition: background-color 0.3s ease;
+    cursor: pointer;
+  }
+
+  input[type="submit"]:hover {
+    background-color: #004494;
+  }
+
+  .link {
+    text-align: center;
+    margin-top: 20px;
+  }
+
+  .link a {
+    color: var(--main-blue);
+    text-decoration: none;
+  }
+
+  .link a:hover {
+    text-decoration: underline;
+  }
+
+  .flash-messages {
+    margin-bottom: 20px;
+  }
+
+  .flash-error {
+    background: #ffe6e6;
+    color: #800000;
+    padding: 10px;
+    border-radius: 6px;
+    border-left: 4px solid #cc0000;
+  }
+  </style>
 </head>
 <body>
-    <h2>Login</h2>
-    {% if error %}
-        <p style="color:red;">{{ error }}</p>
-    {% endif %}
-    <form method="POST">
-        <input type="text" name="username" placeholder="Utilizator" required><br>
-        <input type="password" name="password" placeholder="Parolă" required><br>
-        <button type="submit">Login</button>
+  <div class="container">
+    <h1>{{ title }}</h1>
+
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        <div class="flash-messages">
+          {% for message in messages %}
+            <div class="flash-error">{{ message }}</div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    {% endwith %}
+
+    <form method="post">
+      {% if is_register %}
+        <div class="form-group">
+          <label for="username">Nume utilizator:</label>
+          <input type="text" id="username" name="username" required>
+        </div>
+        <div class="form-group">
+          <label for="email">Email:</label>
+          <input type="email" id="email" name="email" required>
+        </div>
+      {% else %}
+        <div class="form-group">
+          <label for="username">Nume utilizator sau Email:</label>
+          <input type="text" id="username" name="username" required>
+        </div>
+      {% endif %}
+
+      <div class="form-group">
+        <label for="password">Parolă:</label>
+        <input type="password" id="password" name="password" required>
+      </div>
+
+      <input type="submit" value="{{ submit_text }}">
     </form>
-    <p>Nu ai cont? <a href="/register">Înregistrează-te</a></p>
+
+    <div class="link">
+      {% if is_register %}
+        <a href="{{ url_for('login') }}">Ai deja cont? Loghează-te</a>
+      {% else %}
+        <a href="{{ url_for('register') }}">Nu ai cont? Înregistrează-te</a>
+      {% endif %}
+    </div>
+  </div>
 </body>
 </html>
