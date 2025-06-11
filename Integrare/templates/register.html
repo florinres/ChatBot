@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+    <meta charset="UTF-8">
+    <title>Înregistrare</title>
+</head>
+<body>
+    <h2>Înregistrare</h2>
+    {% if error %}
+        <p style="color:red;">{{ error }}</p>
+    {% endif %}
+    <form method="POST">
+        <input type="text" name="username" placeholder="Utilizator" required><br>
+        <input type="password" name="password" placeholder="Parolă" required><br>
+        <button type="submit">Înregistrează-te</button>
+    </form>
+    <p>Ai deja cont? <a href="/login">Autentifică-te</a></p>
+</body>
+</html>

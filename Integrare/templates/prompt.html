@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+    <meta charset="UTF-8">
+    <title>Asistentul tău cu documente</title>
+</head>
+<body>
+    <h2>Bun venit, {{ user }}!</h2>
+    <form method="POST">
+        <input type="text" name="question" placeholder="Pune o întrebare..." required>
+        <button type="submit">Răspunde</button>
+    </form>
+
+    {% if answer %}
+        <div>
+            <h3>Răspuns:</h3>
+            <p>{{ answer }}</p>
+        </div>
+    {% endif %}
+
+    <p><a href="/logout">Logout</a></p>
+</body>
+</html>
