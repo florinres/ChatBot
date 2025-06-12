@@ -1,328 +1,100 @@
-import dataclasses
-import logging
-import os
-import pprint
-from contextlib import ExitStack
-from pathlib import Path
-from typing import TYPE_CHECKING
-
-import fire
-import torch.cuda
-import torch.distributed as dist
-from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
-from torch.optim import AdamW, lr_scheduler
-
-from finetune.args import TrainArgs
-from finetune.checkpointing import Checkpointer
-from finetune.data.data_loader import build_data_loader
-from finetune.distributed import (
-    BACKEND,
-    avg_aggregate,
-    get_rank,
-    get_world_size,
-    is_torchrun,
-    set_device,
+from transformers import (
+    AutoTokenizer, AutoModelForCausalLM, TrainingArguments,
+    Trainer, DataCollatorForLanguageModeling
 )
-from finetune.eval import evaluate
-from finetune.loss import compute_loss_with_mask
-from finetune.mixed_precision import (
-    downcast_mixed_precision,
-    prepare_mixed_precision,
-    upcast_mixed_precision,
+from peft import get_peft_model, LoraConfig, TaskType
+from datasets import Dataset
+import json
+import torch
+
+# 🧾 Load JSONL Alpaca-style dataset
+def load_dataset_from_jsonl(path):
+    data = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            ex = json.loads(line)
+            prompt = f"<s>[INST] {ex['instruction'].strip()} [/INST] {ex['output'].strip()} </s>"
+            data.append({"text": prompt})
+    return Dataset.from_list(data).train_test_split(test_size=0.1)
+
+dataset = load_dataset_from_jsonl("instruction_dataset.jsonl")
+
+# 📦 Model & Tokenizer: TinyLlama
+model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "right"
+
+if torch.cuda.is_available():
+    print(f"✅ GPU is available: {torch.cuda.get_device_name(0)}")
+else:
+    print("❌ GPU is NOT available. Using CPU instead.")
+
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    load_in_4bit=True,  # Requires bitsandbytes
+    device_map="auto"
 )
-from finetune.monitoring.metrics_logger import (
-    MetricsLogger,
-    eval_log_msg,
-    get_eval_logs,
-    get_train_logs,
-    train_log_msg,
+
+# 🔧 LoRA config (adjusted for TinyLlama, which uses q_proj/v_proj like LLaMA)
+lora_config = LoraConfig(
+    r=8,
+    lora_alpha=16,
+    target_modules=["q_proj", "v_proj"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type=TaskType.CAUSAL_LM
 )
-from finetune.monitoring.utils import set_logger
-from finetune.utils import (
-    TrainState,
-    logged_closing,
-    set_random_seed,
+
+model = get_peft_model(model, lora_config)
+model.print_trainable_parameters()
+
+# 🧠 Tokenization
+def tokenize(example):
+    return tokenizer(
+        example["text"],
+        truncation=True,
+        padding="max_length",
+        max_length=512  # TinyLlama context is ~2048, but keep light for 1.1B
+    )
+
+tokenized_dataset = dataset.map(tokenize, batched=True, remove_columns=["text"])
+
+# 📦 Data collator
+data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+# ⚙️ Training arguments
+training_args = TrainingArguments(
+    output_dir="./tinyllama-finetuned",
+    per_device_train_batch_size=4,  # lighter model = bigger batch
+    per_device_eval_batch_size=4,
+    eval_strategy="epoch",
+    save_strategy="epoch",
+    save_total_limit=2,
+    load_best_model_at_end=True,
+    metric_for_best_model="eval_loss",
+    logging_dir="./logs",
+    learning_rate=2e-5,
+    num_train_epochs=2000,
+    weight_decay=0.01,
+    fp16=torch.cuda.is_available(),
+    push_to_hub=False
 )
-from finetune.wrapped_model import load_model, load_args
 
-if TYPE_CHECKING:
-    from mistral_common.tokens.tokenizers.sentencepiece import InstructTokenizerBase
+# 🏋️ Trainer setup
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_dataset["train"],
+    eval_dataset=tokenized_dataset["test"],
+    tokenizer=tokenizer,
+    data_collator=data_collator
+)
 
-logger = logging.getLogger("train")
+# ▶️ Fine-tune
+trainer.train()
 
-
-def main_logger_info(message: str) -> None:
-    if get_rank() == 0:
-        logger.info(message)
-
-
-def train(config: str):
-    args: TrainArgs = TrainArgs.load(config, drop_extra_fields=False)
-    print(f"args: {args}")
-    set_logger(logging.INFO)
-
-    with ExitStack() as exit_stack:
-        _train(args, exit_stack)
-    logger.info("Closed everything!")
-
-
-def _train(
-    args: TrainArgs,
-    exit_stack: ExitStack,
-):
-    # 1. Initial setup and checks
-    set_random_seed(args.seed)
-
-    # Init NCCL
-    if "LOCAL_RANK" in os.environ:
-        set_device()
-        logger.info("Going to init comms...")
-
-        dist.init_process_group(backend=BACKEND)
-    else:
-        logger.error(
-            "PyTorch environment is not correctly initialized. This message should only be displayed when testing."
-        )
-
-    # 2. Init run dir
-    main_logger_info(f"Run dir: {args.run_dir}")
-    run_dir = Path(args.run_dir)
-
-    if is_torchrun():
-        if run_dir.exists():
-            raise RuntimeError(
-                f"Run dir {run_dir} already exists. Make sure to either rename `run_dir` or remove {run_dir}."
-            )
-
-    dist.barrier()
-    run_dir.mkdir(exist_ok=True, parents=True)
-
-    args_path = run_dir / "args.yaml"
-    if not args_path.exists():
-        args.save(args_path)
-
-    main_logger_info(f"TrainArgs: {pprint.pformat(dataclasses.asdict(args))}")
-
-    # 3. Get loggers
-    metrics_logger: MetricsLogger = MetricsLogger(
-        run_dir,
-        tag="train",
-        is_master=get_rank() == 0,
-        wandb_args=args.wandb,
-        mlflow_args=args.mlflow,
-        config=dataclasses.asdict(args),
-    )
-    exit_stack.enter_context(logged_closing(metrics_logger, "metrics_logger"))
-
-    eval_logger: MetricsLogger = MetricsLogger(
-        run_dir,
-        tag="eval",
-        is_master=get_rank() == 0,
-        wandb_args=args.wandb,
-        mlflow_args=args.mlflow,
-        config=dataclasses.asdict(args),
-    )
-    exit_stack.enter_context(logged_closing(eval_logger, "eval_logger"))
-
-    # 5. Potentially download model
-    if Path(args.model_id_or_path).is_dir():
-        model_folder = Path(args.model_id_or_path)
-    else:
-        raise ValueError(
-            "Invalid folder path. Please set `args.initial_model` to a valid folder path."
-        )
-
-    # 6. Load function calling instruct tokenizer
-    vocab_size = load_args(model_folder, args.lora).vocab_size
-    is_tekken = vocab_size > 32768
-
-    instruct_tokenizer: InstructTokenizerBase = MistralTokenizer.v3(
-        is_tekken=is_tekken
-    ).instruct_tokenizer  # type: ignore
-
-    # 7. Load data loaders
-    data_loader = build_data_loader(
-        instruct_tokenizer=instruct_tokenizer,
-        args=args.data,
-        seq_len=args.seq_len,
-        batch_size=args.batch_size,
-        seed=args.seed,
-        rank=get_rank(),  # DDP rank
-        world_size=get_world_size(),  # DDP world_size
-        is_eval=False,
-    )
-
-    if not args.no_eval:
-        assert (
-            args.data.eval_instruct_data != ""
-        ), "Either set `no_eval` to True or provide evaluation samples under `data.eval_instruct_data`"
-
-        eval_data_loader = build_data_loader(
-            instruct_tokenizer=instruct_tokenizer,
-            args=args.data,
-            seq_len=args.seq_len,
-            batch_size=args.batch_size,
-            seed=None,
-            rank=get_rank(),  # DDP rank
-            world_size=get_world_size(),  # DDP world_size
-            is_eval=True,
-        )
-        # pre-load all eval tokens
-        eval_batches = list(eval_data_loader)
-
-    # 8. Load model
-    # Define mixed precision
-    param_dtype = torch.bfloat16
-    optim_dtype = torch.float32
-
-    assert args.lora is not None, "`args.lora` should be set to a valid value."
-
-    model = load_model(
-        folder=model_folder,
-        lora=args.lora,
-        checkpoint=args.checkpoint,
-        param_dtype=param_dtype,
-    )
-
-    # 9. Load optimizer
-    optimizer = AdamW(
-        model.parameters(),
-        lr=args.optim.lr,
-        betas=(0.9, 0.95),
-        eps=1e-08,
-        weight_decay=args.optim.weight_decay,
-    )
-
-    scheduler = lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=args.optim.lr,
-        total_steps=args.max_steps,
-        pct_start=args.optim.pct_start,
-    )
-
-    state = TrainState(args.max_steps)
-
-    # 10. Initialize checkpointer
-    checkpointer = Checkpointer(
-        model=model,
-        state=state,
-        run_dir=run_dir,
-        optimizer=optimizer,
-        num_ckpt_keep=args.num_ckpt_keep,
-    )
-    # 11. Prepare mixed precision
-    prepare_mixed_precision(
-        model.parameters(), param_dtype=param_dtype, optim_dtype=optim_dtype
-    )
-
-    # 12. train!
-    model.train()
-    torch.cuda.empty_cache()
-
-    while state.step < args.max_steps:
-        state.start_step()
-        is_last_step = state.step == args.max_steps
-
-        optimizer.zero_grad()
-
-        loss = torch.tensor([0.0], device="cuda")
-        n_batch_tokens: int = 0
-
-        for i in range(args.num_microbatches):
-            # batch
-            batch = next(data_loader)
-
-            x = torch.from_numpy(batch.x).cuda(non_blocking=True)
-            y = torch.from_numpy(batch.y).cuda(non_blocking=True)
-            y_mask = (
-                torch.from_numpy(batch.y_mask).cuda(non_blocking=True)
-                if batch.y_mask is not None
-                else None
-            )
-
-            # forward / backward
-            output = model(
-                input_ids=x,
-                seqlens=batch.sizes,
-            )
-            mb_loss = compute_loss_with_mask(output, y, y_mask)
-
-            mb_loss.backward()
-
-            loss += mb_loss.detach()
-            n_batch_tokens += x.numel()
-
-            if i < args.num_microbatches - 1:
-                # synchronize CUDA to re-run backward
-                assert args.num_microbatches > 1  # should not happen
-                torch.cuda.synchronize()
-
-        if args.num_microbatches > 1:
-            loss /= args.num_microbatches
-            for p in model.parameters():
-                if p.requires_grad:
-                    assert p.grad is not None
-                    p.grad.div_(args.num_microbatches)
-
-        # upcast params for optimizer update
-        upcast_mixed_precision(model.parameters(), optim_dtype=optim_dtype)
-
-        # clip grad norm
-        model.clip_grad_norm_(max_norm=args.max_norm)
-
-        # optimizer step
-        optimizer.step()
-
-        # downcast params for forward & backward
-        downcast_mixed_precision(model.parameters(), param_dtype=param_dtype)
-
-        last_lr = scheduler.get_last_lr()[0]
-        scheduler.step()
-
-        # Host sync
-        loss_item = loss.item()
-        avg_loss = avg_aggregate(loss_item)
-
-        if not args.no_eval and (
-            (args.eval_freq > 0 and state.step % args.eval_freq == 0) or is_last_step
-        ):
-            # write perplexity to state
-            evaluate(model, eval_batches, state)
-
-            eval_logs = get_eval_logs(
-                state.step, avg_loss, state.this_eval_perplexity, state.this_eval_loss
-            )
-
-            main_logger_info(eval_log_msg(eval_logs))
-            eval_logger.log(eval_logs, step=state.step)
-
-        # Timing
-        state.end_step(n_batch_tokens)
-
-        if state.step % args.log_freq == 0:
-            train_logs = get_train_logs(
-                state,
-                avg_loss,
-                last_lr,
-                torch.cuda.max_memory_allocated(),
-                torch.cuda.memory_allocated(),
-                args,
-            )
-            main_logger_info(train_log_msg(state, logs=train_logs, loss=avg_loss))
-            metrics_logger.log(train_logs, step=state.step)
-
-        if not args.no_ckpt and (
-            (args.ckpt_freq > 0 and state.step % args.ckpt_freq == 0) or is_last_step
-        ):
-            checkpointer.save_checkpoint(
-                save_only_lora=args.save_adapters,
-                dtype=param_dtype,
-                instruct_tokenizer=instruct_tokenizer,
-            )
-
-    main_logger_info("done!")
-
-
-if __name__ == "__main__":
-    """See README.md for usage."""
-    fire.Fire(train)
+# 💾 Save model and tokenizer
+trainer.save_model("./tinyllama-finetuned")
+tokenizer.save_pretrained("./tinyllama-finetuned")
